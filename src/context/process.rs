@@ -91,6 +91,17 @@ pub trait ProcessContext<P: Plugin> {
         0
     }
 
+    /// The number of events passed to [`send_event()`][Self::send_event()] that the wrapper
+    /// dropped since the plugin was created because its output event queue was full. The CLAP
+    /// wrapper sizes that queue when the plugin is activated, with room for one event per event
+    /// its input queue holds plus one per voice of
+    /// [`ClapPlugin::CLAP_POLY_MODULATION_CONFIG`][crate::prelude::ClapPlugin::CLAP_POLY_MODULATION_CONFIG]'s
+    /// maximum capacity, and never grows it while processing. The other wrappers grow their
+    /// queues rather than drop events and return 0.
+    fn dropped_output_events(&self) -> u64 {
+        0
+    }
+
     /// Update the current latency of the plugin. If the plugin is currently processing audio, then
     /// this may cause audio playback to be restarted.
     fn set_latency_samples(&self, samples: u32);

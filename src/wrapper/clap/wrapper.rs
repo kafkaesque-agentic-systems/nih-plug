@@ -152,8 +152,12 @@ pub struct Wrapper<P: ClapPlugin> {
     /// [`ProcessContext::dropped_input_events()`][crate::prelude::ProcessContext::dropped_input_events()].
     pub(super) dropped_input_events: AtomicU64,
     /// Stores any events the plugin has output during the current processing cycle, analogous to
-    /// `input_events`.
+    /// `input_events`. Sized in `clap_plugin::activate()` and never grown while processing.
     output_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
+    /// Output events lost since the plugin was created because `output_events` was full. The
+    /// plugin reads it through
+    /// [`ProcessContext::dropped_output_events()`][crate::prelude::ProcessContext::dropped_output_events()].
+    pub(super) dropped_output_events: AtomicU64,
     /// The last process status returned by the plugin. This is used for tail handling.
     last_process_status: AtomicCell<ProcessStatus>,
     /// The current latency in samples, as set by the plugin through the [`ProcessContext`]. Uses
@@ -563,6 +567,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             input_events: AtomicRefCell::new(VecDeque::with_capacity(MIN_INPUT_EVENT_CAPACITY)),
             dropped_input_events: AtomicU64::new(0),
             output_events: AtomicRefCell::new(VecDeque::with_capacity(512)),
+            dropped_output_events: AtomicU64::new(0),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::initialize()` so that during the
@@ -1962,10 +1967,16 @@ impl<P: ClapPlugin> Wrapper<P> {
             *wrapper.buffer_manager.borrow_mut() =
                 BufferManager::for_audio_io_layout(max_frames_count as usize, audio_io_layout);
 
-            // The event queue is sized here too, on the main thread before processing starts,
-            // because `process()` must never grow it
-            *wrapper.input_events.borrow_mut() =
-                VecDeque::with_capacity(input_event_capacity(max_frames_count));
+            // The event queues are sized here too, on the main thread before processing starts,
+            // because `process()` must never grow them. The output queue has room for an event
+            // per input event and one more per voice: a block can end every voice that was
+            // sounding when it started and every voice a note on in it started.
+            let input_events = VecDeque::with_capacity(input_event_capacity(max_frames_count));
+            let max_voice_capacity = P::CLAP_POLY_MODULATION_CONFIG
+                .map_or(0, |config| config.max_voice_capacity as usize);
+            *wrapper.output_events.borrow_mut() =
+                VecDeque::with_capacity(input_events.capacity() + max_voice_capacity);
+            *wrapper.input_events.borrow_mut() = input_events;
 
             // Also store this for later, so we can reinitialize the plugin after restoring state
             wrapper.current_buffer_config.store(Some(buffer_config));
@@ -3301,6 +3312,17 @@ fn input_event_capacity(max_frames_count: u32) -> usize {
     (max_frames_count as usize).max(MIN_INPUT_EVENT_CAPACITY)
 }
 
+/// Pushes `event` onto `queue` unless it is full, so that the queue never grows: growing would
+/// allocate on the audio thread. Returns whether the event was dropped.
+pub(super) fn push_without_growing<E>(queue: &mut VecDeque<E>, event: E) -> bool {
+    if queue.len() == queue.capacity() {
+        return true;
+    }
+    queue.push_back(event);
+
+    false
+}
+
 /// Pushes `event` onto `queue` without growing it, since growing would allocate on the audio
 /// thread. A full queue keeps note ons, note offs and chokes over every other event: losing one
 /// of those leaves a voice stuck or a note unplayed, while a lost expression, modulation or
@@ -3483,6 +3505,20 @@ mod tests {
             ]
         );
         assert_eq!(queue.capacity(), capacity);
+    }
+
+    #[test]
+    fn output_events_beyond_capacity_are_dropped_without_growing_the_queue() {
+        let mut queue = full_queue([note_off(0), note_off(1)]);
+        let capacity = queue.capacity();
+
+        assert!(push_without_growing(&mut queue, note_off(2)));
+
+        assert_eq!(Vec::from(queue.clone()), [note_off(0), note_off(1)]);
+        assert_eq!(queue.capacity(), capacity);
+        queue.clear();
+        assert!(!push_without_growing(&mut queue, note_off(3)));
+        assert_eq!(Vec::from(queue), [note_off(3)]);
     }
 
     #[test]

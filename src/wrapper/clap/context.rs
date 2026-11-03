@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::wrapper::{OutputParamEvent, Task, Wrapper};
+use super::wrapper::{push_without_growing, OutputParamEvent, Task, Wrapper};
 use crate::event_loop::EventLoop;
 use crate::prelude::{
     ClapPlugin, GuiContext, InitContext, ParamPtr, PluginApi, PluginNoteEvent, ProcessContext,
@@ -116,11 +116,19 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
     }
 
     fn send_event(&mut self, event: PluginNoteEvent<P>) {
-        self.output_events_guard.push_back(event);
+        if push_without_growing(&mut self.output_events_guard, event) {
+            self.wrapper
+                .dropped_output_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn dropped_input_events(&self) -> u64 {
         self.wrapper.dropped_input_events.load(Ordering::Relaxed)
+    }
+
+    fn dropped_output_events(&self) -> u64 {
+        self.wrapper.dropped_output_events.load(Ordering::Relaxed)
     }
 
     fn set_latency_samples(&self, samples: u32) {
