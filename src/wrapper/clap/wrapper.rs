@@ -3214,6 +3214,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+
+                    // The loaded state changed the parameter values, so tell the host to read
+                    // them again, as the GUI-initiated load in `set_state_object_from_gui()`
+                    // already does (clap_host_params::rescan, CLAP_PARAM_RESCAN_VALUES).
+                    let task_posted = wrapper.schedule_gui(Task::RescanParamValues);
+                    nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
                 }
 
                 success
