@@ -80,6 +80,17 @@ pub trait ProcessContext<P: Plugin> {
     /// otherwise.
     fn send_event(&mut self, event: PluginNoteEvent<P>);
 
+    /// The number of incoming note events the wrapper dropped since the plugin was created
+    /// because a block brought more events than its input event queue holds. The CLAP wrapper
+    /// sizes that queue when the plugin is activated, one event per frame of the largest block
+    /// and at least 512, and never grows it while processing. When it is full, expression,
+    /// modulation and MIDI CC events are dropped first: an incoming note on, note off or choke
+    /// takes the place of the newest of them, and is itself dropped only when the queue holds
+    /// nothing else. The other wrappers grow their queues rather than drop events and return 0.
+    fn dropped_input_events(&self) -> u64 {
+        0
+    }
+
     /// Update the current latency of the plugin. If the plugin is currently processing audio, then
     /// this may cause audio playback to be restarted.
     fn set_latency_samples(&self, samples: u32);

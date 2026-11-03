@@ -72,7 +72,7 @@ use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
@@ -99,6 +99,10 @@ use crate::wrapper::util::{
 /// How many output parameter changes we can store in our output parameter change queue. Storing
 /// more than this many parameters at a time will cause changes to get lost.
 const OUTPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
+
+/// The fewest note events the input event queue holds. `clap_plugin::activate()` sizes it to one
+/// event per frame of the host's largest block when that is more.
+pub const MIN_INPUT_EVENT_CAPACITY: usize = 512;
 
 pub struct Wrapper<P: ClapPlugin> {
     /// A reference to this object, upgraded to an `Arc<Self>` for the GUI context.
@@ -139,7 +143,14 @@ pub struct Wrapper<P: ClapPlugin> {
     ///
     /// TODO: Maybe load these lazily at some point instead of needing to spool them all to this
     ///       queue first
+    ///
+    /// Sized in `clap_plugin::activate()` and never grown while processing, see
+    /// [`push_input_event()`][Self::push_input_event()].
     input_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
+    /// Input events lost since the plugin was created because a block brought more events than
+    /// `input_events` holds. The plugin reads it through
+    /// [`ProcessContext::dropped_input_events()`][crate::prelude::ProcessContext::dropped_input_events()].
+    pub(super) dropped_input_events: AtomicU64,
     /// Stores any events the plugin has output during the current processing cycle, analogous to
     /// `input_events`.
     output_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
@@ -549,7 +560,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             ),
             current_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
-            input_events: AtomicRefCell::new(VecDeque::with_capacity(512)),
+            input_events: AtomicRefCell::new(VecDeque::with_capacity(MIN_INPUT_EVENT_CAPACITY)),
+            dropped_input_events: AtomicU64::new(0),
             output_events: AtomicRefCell::new(VecDeque::with_capacity(512)),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
             current_latency: AtomicU32::new(0),
@@ -1431,7 +1443,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let normalized_value =
                         event.value as f32 / param_ptr.step_count().unwrap_or(1) as f32;
 
-                    push_input_event(
+                    self.push_input_event(
                         input_events,
                         NoteEvent::MonoAutomation {
                             timing,
@@ -1456,7 +1468,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             // The host may also add key and channel information here, but it may
                             // also pass -1. So not having that information here at all seems like
                             // the safest choice.
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyModulation {
                                     timing,
@@ -1490,7 +1502,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_ON) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     let event = &*(event as *const clap_event_note);
-                    push_input_event(
+                    self.push_input_event(
                         input_events,
                         NoteEvent::NoteOn {
                             // When splitting up the buffer for sample accurate automation all events
@@ -1511,7 +1523,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     let event = &*(event as *const clap_event_note);
-                    push_input_event(
+                    self.push_input_event(
                         input_events,
                         NoteEvent::NoteOff {
                             timing,
@@ -1530,7 +1542,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_CHOKE) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     let event = &*(event as *const clap_event_note);
-                    push_input_event(
+                    self.push_input_event(
                         input_events,
                         NoteEvent::Choke {
                             timing,
@@ -1552,7 +1564,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let event = &*(event as *const clap_event_note_expression);
                     match event.expression_id {
                         CLAP_NOTE_EXPRESSION_PRESSURE => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyPressure {
                                     timing,
@@ -1568,7 +1580,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             );
                         }
                         CLAP_NOTE_EXPRESSION_VOLUME => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyVolume {
                                     timing,
@@ -1584,7 +1596,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             );
                         }
                         CLAP_NOTE_EXPRESSION_PAN => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyPan {
                                     timing,
@@ -1601,7 +1613,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             );
                         }
                         CLAP_NOTE_EXPRESSION_TUNING => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyTuning {
                                     timing,
@@ -1617,7 +1629,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             );
                         }
                         CLAP_NOTE_EXPRESSION_VIBRATO => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyVibrato {
                                     timing,
@@ -1633,7 +1645,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             );
                         }
                         CLAP_NOTE_EXPRESSION_EXPRESSION => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyExpression {
                                     timing,
@@ -1649,7 +1661,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                             );
                         }
                         CLAP_NOTE_EXPRESSION_BRIGHTNESS => {
-                            push_input_event(
+                            self.push_input_event(
                                 input_events,
                                 NoteEvent::PolyBrightness {
                                     timing,
@@ -1680,10 +1692,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                         | NoteEvent::NoteOff { .. }
                         | NoteEvent::PolyPressure { .. }),
                     ) if P::MIDI_INPUT >= MidiConfig::Basic => {
-                        push_input_event(input_events, note_event);
+                        self.push_input_event(input_events, note_event);
                     }
                     Ok(note_event) if P::MIDI_INPUT >= MidiConfig::MidiCCs => {
-                        push_input_event(input_events, note_event);
+                        self.push_input_event(input_events, note_event);
                     }
                     Ok(_) => (),
                     Err(n) => nih_debug_assert_failure!("Unhandled MIDI message type {}", n),
@@ -1699,7 +1711,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 assert!(!event.buffer.is_null());
                 let sysex_buffer = std::slice::from_raw_parts(event.buffer, event.size as usize);
                 if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
-                    push_input_event(input_events, note_event);
+                    self.push_input_event(input_events, note_event);
                 };
             }
             _ => {
@@ -1709,6 +1721,19 @@ impl<P: ClapPlugin> Wrapper<P> {
                     raw_event.space_id
                 );
             }
+        }
+    }
+
+    /// Append a decoded event to the input event queue without growing it. See
+    /// [`push_keeping_note_events()`] for what happens when it is full. Every lost event is
+    /// counted in [`dropped_input_events`][Self::dropped_input_events].
+    fn push_input_event(
+        &self,
+        input_events: &mut VecDeque<PluginNoteEvent<P>>,
+        event: PluginNoteEvent<P>,
+    ) {
+        if push_keeping_note_events(input_events, event) {
+            self.dropped_input_events.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1936,6 +1961,11 @@ impl<P: ClapPlugin> Wrapper<P> {
             // pointers into a set of `Buffer` objects for the plugin's main and auxiliary IO
             *wrapper.buffer_manager.borrow_mut() =
                 BufferManager::for_audio_io_layout(max_frames_count as usize, audio_io_layout);
+
+            // The event queue is sized here too, on the main thread before processing starts,
+            // because `process()` must never grow it
+            *wrapper.input_events.borrow_mut() =
+                VecDeque::with_capacity(input_event_capacity(max_frames_count));
 
             // Also store this for later, so we can reinitialize the plugin after restoring state
             wrapper.current_buffer_config.store(Some(buffer_config));
@@ -3265,17 +3295,44 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 }
 
-/// Appends a decoded event to the pre-sized input event queue without growing it: growing
-/// would allocate on the audio thread. Events beyond the queue's capacity are dropped, which
-/// only a host sending more note events in one block than the queue holds can cause.
-fn push_input_event<E>(input_events: &mut VecDeque<E>, event: E) {
-    if input_events.len() < input_events.capacity() {
-        input_events.push_back(event);
-    } else {
-        nih_debug_assert_failure!(
-            "More note events in one block than the input event queue holds, dropping one"
-        );
+/// The number of events the input event queue holds for blocks of up to `max_frames_count`
+/// frames: one per frame, and never fewer than [`MIN_INPUT_EVENT_CAPACITY`].
+fn input_event_capacity(max_frames_count: u32) -> usize {
+    (max_frames_count as usize).max(MIN_INPUT_EVENT_CAPACITY)
+}
+
+/// Pushes `event` onto `queue` without growing it, since growing would allocate on the audio
+/// thread. A full queue keeps note ons, note offs and chokes over every other event: losing one
+/// of those leaves a voice stuck or a note unplayed, while a lost expression, modulation or
+/// controller value is superseded by the next one. So an incoming note on, note off or choke
+/// takes the place of the newest queued event that is none of these, and any other incoming
+/// event is dropped. Returns whether an event was lost. The queue stays in timing order since
+/// events arrive sorted and `VecDeque::remove()` shifts the rest without allocating.
+fn push_keeping_note_events<S>(queue: &mut VecDeque<NoteEvent<S>>, event: NoteEvent<S>) -> bool {
+    if queue.len() < queue.capacity() {
+        queue.push_back(event);
+        return false;
     }
+
+    let starts_or_ends_a_voice = |event: &NoteEvent<S>| {
+        matches!(
+            event,
+            NoteEvent::NoteOn { .. } | NoteEvent::NoteOff { .. } | NoteEvent::Choke { .. }
+        )
+    };
+    if !starts_or_ends_a_voice(&event) {
+        return true;
+    }
+    let Some(evicted) = queue
+        .iter()
+        .rposition(|queued| !starts_or_ends_a_voice(queued))
+    else {
+        return true;
+    };
+    queue.remove(evicted);
+    queue.push_back(event);
+
+    true
 }
 
 /// Convenience function to query an extension from the host.
@@ -3293,5 +3350,150 @@ unsafe fn query_host_extension<T>(
         Some(ClapPtr::new(extension_ptr as *const T))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Event = NoteEvent<()>;
+
+    fn note_on(timing: u32) -> Event {
+        NoteEvent::NoteOn {
+            timing,
+            voice_id: Some(timing as i32),
+            channel: 0,
+            note: 60,
+            velocity: 1.0,
+        }
+    }
+
+    fn note_off(timing: u32) -> Event {
+        NoteEvent::NoteOff {
+            timing,
+            voice_id: Some(timing as i32),
+            channel: 0,
+            note: 60,
+            velocity: 0.0,
+        }
+    }
+
+    fn choke(timing: u32) -> Event {
+        NoteEvent::Choke {
+            timing,
+            voice_id: Some(timing as i32),
+            channel: 0,
+            note: 60,
+        }
+    }
+
+    fn pressure(timing: u32) -> Event {
+        NoteEvent::PolyPressure {
+            timing,
+            voice_id: Some(timing as i32),
+            channel: 0,
+            note: 60,
+            pressure: 0.5,
+        }
+    }
+
+    fn mod_wheel(timing: u32) -> Event {
+        NoteEvent::MidiCC {
+            timing,
+            channel: 0,
+            cc: 1,
+            value: 0.5,
+        }
+    }
+
+    /// A queue holding exactly `events`, so that it is full.
+    fn full_queue<const N: usize>(events: [Event; N]) -> VecDeque<Event> {
+        let mut queue = VecDeque::with_capacity(N);
+        queue.extend(events);
+        assert_eq!(queue.len(), queue.capacity(), "the test needs a full queue");
+        queue
+    }
+
+    #[test]
+    fn input_queue_holds_one_event_per_frame_and_never_fewer_than_the_minimum() {
+        assert_eq!(input_event_capacity(0), MIN_INPUT_EVENT_CAPACITY);
+        assert_eq!(input_event_capacity(256), MIN_INPUT_EVENT_CAPACITY);
+        assert_eq!(input_event_capacity(4096), 4096);
+    }
+
+    #[test]
+    fn events_below_capacity_are_queued_in_order() {
+        let mut queue = VecDeque::with_capacity(8);
+        for event in [pressure(0), note_on(1), mod_wheel(2), note_off(3)] {
+            assert!(!push_keeping_note_events(&mut queue, event));
+        }
+
+        assert_eq!(
+            Vec::from(queue),
+            [pressure(0), note_on(1), mod_wheel(2), note_off(3)]
+        );
+    }
+
+    #[test]
+    fn full_queue_drops_an_incoming_expression_or_controller() {
+        let mut queue = full_queue([note_on(0), pressure(1), note_on(2), pressure(3)]);
+        let capacity = queue.capacity();
+
+        assert!(push_keeping_note_events(&mut queue, pressure(100)));
+        assert!(push_keeping_note_events(&mut queue, mod_wheel(101)));
+
+        assert_eq!(
+            Vec::from(queue.clone()),
+            [note_on(0), pressure(1), note_on(2), pressure(3)]
+        );
+        assert_eq!(queue.capacity(), capacity);
+    }
+
+    #[test]
+    fn note_events_evict_the_newest_other_event_from_a_full_queue() {
+        let mut queue = full_queue([
+            note_on(0),
+            pressure(1),
+            note_on(2),
+            pressure(3),
+            note_on(4),
+            pressure(5),
+            note_on(6),
+            mod_wheel(7),
+        ]);
+        let capacity = queue.capacity();
+
+        for event in [note_off(100), choke(101), note_on(102)] {
+            assert!(push_keeping_note_events(&mut queue, event));
+        }
+
+        // The controller, then the newest pressure events made room; the queue kept its order
+        assert_eq!(
+            Vec::from(queue.clone()),
+            [
+                note_on(0),
+                pressure(1),
+                note_on(2),
+                note_on(4),
+                note_on(6),
+                note_off(100),
+                choke(101),
+                note_on(102),
+            ]
+        );
+        assert_eq!(queue.capacity(), capacity);
+    }
+
+    #[test]
+    fn note_event_is_dropped_when_only_note_events_are_queued() {
+        let mut queue = full_queue([note_on(0), note_off(1), choke(2), note_on(3)]);
+
+        assert!(push_keeping_note_events(&mut queue, note_off(100)));
+
+        assert_eq!(
+            Vec::from(queue),
+            [note_on(0), note_off(1), choke(2), note_on(3)]
+        );
     }
 }

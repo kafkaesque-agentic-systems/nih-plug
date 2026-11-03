@@ -4,6 +4,7 @@ use clap_sys::id::{clap_id, CLAP_INVALID_ID};
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::wrapper::{OutputParamEvent, Task, Wrapper};
@@ -116,6 +117,10 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
 
     fn send_event(&mut self, event: PluginNoteEvent<P>) {
         self.output_events_guard.push_back(event);
+    }
+
+    fn dropped_input_events(&self) -> u64 {
+        self.wrapper.dropped_input_events.load(Ordering::Relaxed)
     }
 
     fn set_latency_samples(&self, samples: u32) {

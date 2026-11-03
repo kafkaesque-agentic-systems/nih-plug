@@ -8,7 +8,7 @@ mod wrapper;
 
 /// Re-export for the macro
 pub use self::descriptor::PluginDescriptor;
-pub use self::wrapper::Wrapper;
+pub use self::wrapper::{Wrapper, MIN_INPUT_EVENT_CAPACITY};
 pub use clap_sys::entry::clap_plugin_entry;
 pub use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
 pub use clap_sys::host::clap_host;
