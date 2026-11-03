@@ -1431,11 +1431,14 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let normalized_value =
                         event.value as f32 / param_ptr.step_count().unwrap_or(1) as f32;
 
-                    input_events.push_back(NoteEvent::MonoAutomation {
-                        timing,
-                        poly_modulation_id: *poly_modulation_id,
-                        normalized_value,
-                    });
+                    push_input_event(
+                        input_events,
+                        NoteEvent::MonoAutomation {
+                            timing,
+                            poly_modulation_id: *poly_modulation_id,
+                            normalized_value,
+                        },
+                    );
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_MOD) => {
@@ -1453,12 +1456,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                             // The host may also add key and channel information here, but it may
                             // also pass -1. So not having that information here at all seems like
                             // the safest choice.
-                            input_events.push_back(NoteEvent::PolyModulation {
-                                timing,
-                                voice_id: event.note_id,
-                                poly_modulation_id: *poly_modulation_id,
-                                normalized_offset,
-                            });
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyModulation {
+                                    timing,
+                                    voice_id: event.note_id,
+                                    poly_modulation_id: *poly_modulation_id,
+                                    normalized_offset,
+                                },
+                            );
 
                             return;
                         }
@@ -1484,51 +1490,60 @@ impl<P: ClapPlugin> Wrapper<P> {
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_ON) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     let event = &*(event as *const clap_event_note);
-                    input_events.push_back(NoteEvent::NoteOn {
-                        // When splitting up the buffer for sample accurate automation all events
-                        // should be relative to the block
-                        timing,
-                        voice_id: if event.note_id != -1 {
-                            Some(event.note_id)
-                        } else {
-                            None
+                    push_input_event(
+                        input_events,
+                        NoteEvent::NoteOn {
+                            // When splitting up the buffer for sample accurate automation all events
+                            // should be relative to the block
+                            timing,
+                            voice_id: if event.note_id != -1 {
+                                Some(event.note_id)
+                            } else {
+                                None
+                            },
+                            channel: event.channel as u8,
+                            note: event.key as u8,
+                            velocity: event.velocity as f32,
                         },
-                        channel: event.channel as u8,
-                        note: event.key as u8,
-                        velocity: event.velocity as f32,
-                    });
+                    );
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     let event = &*(event as *const clap_event_note);
-                    input_events.push_back(NoteEvent::NoteOff {
-                        timing,
-                        voice_id: if event.note_id != -1 {
-                            Some(event.note_id)
-                        } else {
-                            None
+                    push_input_event(
+                        input_events,
+                        NoteEvent::NoteOff {
+                            timing,
+                            voice_id: if event.note_id != -1 {
+                                Some(event.note_id)
+                            } else {
+                                None
+                            },
+                            channel: event.channel as u8,
+                            note: event.key as u8,
+                            velocity: event.velocity as f32,
                         },
-                        channel: event.channel as u8,
-                        note: event.key as u8,
-                        velocity: event.velocity as f32,
-                    });
+                    );
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_CHOKE) => {
                 if P::MIDI_INPUT >= MidiConfig::Basic {
                     let event = &*(event as *const clap_event_note);
-                    input_events.push_back(NoteEvent::Choke {
-                        timing,
-                        voice_id: if event.note_id != -1 {
-                            Some(event.note_id)
-                        } else {
-                            None
+                    push_input_event(
+                        input_events,
+                        NoteEvent::Choke {
+                            timing,
+                            voice_id: if event.note_id != -1 {
+                                Some(event.note_id)
+                            } else {
+                                None
+                            },
+                            // FIXME: These values are also allowed to be -1, we need to support that
+                            channel: event.channel as u8,
+                            note: event.key as u8,
                         },
-                        // FIXME: These values are also allowed to be -1, we need to support that
-                        channel: event.channel as u8,
-                        note: event.key as u8,
-                    });
+                    );
                 }
             }
             (CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_EXPRESSION) => {
@@ -1537,96 +1552,117 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let event = &*(event as *const clap_event_note_expression);
                     match event.expression_id {
                         CLAP_NOTE_EXPRESSION_PRESSURE => {
-                            input_events.push_back(NoteEvent::PolyPressure {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyPressure {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    pressure: event.value as f32,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                pressure: event.value as f32,
-                            });
+                            );
                         }
                         CLAP_NOTE_EXPRESSION_VOLUME => {
-                            input_events.push_back(NoteEvent::PolyVolume {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyVolume {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    gain: event.value as f32,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                gain: event.value as f32,
-                            });
+                            );
                         }
                         CLAP_NOTE_EXPRESSION_PAN => {
-                            input_events.push_back(NoteEvent::PolyPan {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyPan {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    // In CLAP this value goes from [0, 1] instead of [-1, 1]
+                                    pan: (event.value as f32 * 2.0) - 1.0,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                // In CLAP this value goes from [0, 1] instead of [-1, 1]
-                                pan: (event.value as f32 * 2.0) - 1.0,
-                            });
+                            );
                         }
                         CLAP_NOTE_EXPRESSION_TUNING => {
-                            input_events.push_back(NoteEvent::PolyTuning {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyTuning {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    tuning: event.value as f32,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                tuning: event.value as f32,
-                            });
+                            );
                         }
                         CLAP_NOTE_EXPRESSION_VIBRATO => {
-                            input_events.push_back(NoteEvent::PolyVibrato {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyVibrato {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    vibrato: event.value as f32,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                vibrato: event.value as f32,
-                            });
+                            );
                         }
                         CLAP_NOTE_EXPRESSION_EXPRESSION => {
-                            input_events.push_back(NoteEvent::PolyExpression {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyExpression {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    expression: event.value as f32,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                expression: event.value as f32,
-                            });
+                            );
                         }
                         CLAP_NOTE_EXPRESSION_BRIGHTNESS => {
-                            input_events.push_back(NoteEvent::PolyBrightness {
-                                timing,
-                                voice_id: if event.note_id != -1 {
-                                    Some(event.note_id)
-                                } else {
-                                    None
+                            push_input_event(
+                                input_events,
+                                NoteEvent::PolyBrightness {
+                                    timing,
+                                    voice_id: if event.note_id != -1 {
+                                        Some(event.note_id)
+                                    } else {
+                                        None
+                                    },
+                                    channel: event.channel as u8,
+                                    note: event.key as u8,
+                                    brightness: event.value as f32,
                                 },
-                                channel: event.channel as u8,
-                                note: event.key as u8,
-                                brightness: event.value as f32,
-                            });
+                            );
                         }
                         n => nih_debug_assert_failure!("Unhandled note expression ID {}", n),
                     }
@@ -1644,10 +1680,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                         | NoteEvent::NoteOff { .. }
                         | NoteEvent::PolyPressure { .. }),
                     ) if P::MIDI_INPUT >= MidiConfig::Basic => {
-                        input_events.push_back(note_event);
+                        push_input_event(input_events, note_event);
                     }
                     Ok(note_event) if P::MIDI_INPUT >= MidiConfig::MidiCCs => {
-                        input_events.push_back(note_event);
+                        push_input_event(input_events, note_event);
                     }
                     Ok(_) => (),
                     Err(n) => nih_debug_assert_failure!("Unhandled MIDI message type {}", n),
@@ -1663,7 +1699,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 assert!(!event.buffer.is_null());
                 let sysex_buffer = std::slice::from_raw_parts(event.buffer, event.size as usize);
                 if let Ok(note_event) = NoteEvent::from_midi(timing, sysex_buffer) {
-                    input_events.push_back(note_event);
+                    push_input_event(input_events, note_event);
                 };
             }
             _ => {
@@ -3220,6 +3256,19 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             None => false,
         }
+    }
+}
+
+/// Appends a decoded event to the pre-sized input event queue without growing it: growing
+/// would allocate on the audio thread. Events beyond the queue's capacity are dropped, which
+/// only a host sending more note events in one block than the queue holds can cause.
+fn push_input_event<E>(input_events: &mut VecDeque<E>, event: E) {
+    if input_events.len() < input_events.capacity() {
+        input_events.push_back(event);
+    } else {
+        nih_debug_assert_failure!(
+            "More note events in one block than the input event queue holds, dropping one"
+        );
     }
 }
 
