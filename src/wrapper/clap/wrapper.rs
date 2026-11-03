@@ -3151,16 +3151,27 @@ impl<P: ClapPlugin> Wrapper<P> {
             );
             return false;
         }
-        let length = u64::from_le_bytes(length_bytes);
-
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
-        if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
-            nih_debug_assert_failure!(
-                "Error or end of stream while reading the state buffer from the stream."
-            );
+        let Ok(length) = usize::try_from(u64::from_le_bytes(length_bytes)) else {
+            nih_debug_assert_failure!("The state length does not fit in memory.");
             return false;
+        };
+
+        // The length prefix comes from the host's stream and cannot be trusted: a corrupt or
+        // random prefix must not make us allocate more than the stream actually holds. Read
+        // in bounded chunks and grow the buffer only by what was read.
+        const STATE_READ_CHUNK: usize = 64 * 1024;
+        let mut chunk = vec![0u8; STATE_READ_CHUNK.min(length)];
+        let mut read_buffer: Vec<u8> = Vec::new();
+        while read_buffer.len() < length {
+            let want = (length - read_buffer.len()).min(chunk.len());
+            if !read_stream(&*stream, &mut chunk[..want]) {
+                nih_debug_assert_failure!(
+                    "Error or end of stream while reading the state buffer from the stream."
+                );
+                return false;
+            }
+            read_buffer.extend_from_slice(&chunk[..want]);
         }
-        read_buffer.set_len(length as usize);
 
         match state::deserialize_json(&read_buffer) {
             Some(mut state) => {
