@@ -3258,8 +3258,15 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                     // The loaded state changed the parameter values, so tell the host to read
                     // them again, as the GUI-initiated load in `set_state_object_from_gui()`
-                    // already does (clap_host_params::rescan, CLAP_PARAM_RESCAN_VALUES).
-                    let task_posted = wrapper.schedule_gui(Task::RescanParamValues);
+                    // already does (clap_host_params::rescan, CLAP_PARAM_RESCAN_VALUES). The task
+                    // is posted rather than passed to `schedule_gui()`, which would run it right
+                    // away on this main thread and call back into the host from inside its own
+                    // `load()`: the host calls `on_main_thread()` once `load()` has returned.
+                    let task_posted = wrapper.tasks.push(Task::RescanParamValues).is_ok();
+                    if task_posted {
+                        let host = &wrapper.host_callback;
+                        unsafe_clap_call! { host=>request_callback(&**host) };
+                    }
                     nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
                 }
 
