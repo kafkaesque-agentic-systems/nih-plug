@@ -132,6 +132,10 @@ impl<P: Vst3Plugin> GuiContext for WrapperGuiContext<P> {
         true
     }
 
+    fn request_process(&self) {
+        // VST3 has no way to wake a plugin; its hosts keep calling `process()`
+    }
+
     // All of these functions are supposed to be called from the main thread, so we'll put some
     // trust in the caller and assume that this is indeed the case
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {

@@ -26,6 +26,15 @@ pub trait GuiContext: Send + Sync + 'static {
     /// TODO: Host->Plugin resizing has not been implemented yet
     fn request_resize(&self) -> bool;
 
+    /// Ask the host to call the plugin's `process()` function again. A host may stop calling
+    /// `process()` while the plugin's output is quiet (for instance after
+    /// [`ProcessStatus::Normal`][crate::prelude::ProcessStatus::Normal]) and only resume for its
+    /// own events, so work the GUI hands to the audio thread through other means would otherwise
+    /// wait for the next note or parameter change. Unlike the other functions here, this may be
+    /// called from any thread. Under CLAP this is `clap_host::request_process()`; the VST3 and
+    /// standalone wrappers keep calling `process()` and do nothing.
+    fn request_process(&self);
+
     /// Inform the host a parameter will be automated. Create a [`ParamSetter`] and use
     /// [`ParamSetter::begin_set_parameter()`] instead for a safe, user friendly API.
     ///

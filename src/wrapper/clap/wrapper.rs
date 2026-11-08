@@ -803,6 +803,14 @@ impl<P: ClapPlugin> Wrapper<P> {
         result
     }
 
+    /// Ask the host to activate the plugin's processing and call `process()`, even when the plugin
+    /// is asleep after returning `CLAP_PROCESS_CONTINUE_IF_NOT_QUIET` or `CLAP_PROCESS_SLEEP`.
+    /// `clap_host::request_process()` is thread-safe.
+    pub fn request_process(&self) {
+        let host = &self.host_callback;
+        unsafe_clap_call! { host=>request_process(&**host) };
+    }
+
     /// Request a resize based on the editor's current reported size. As of CLAP 0.24 this can
     /// safely be called from any thread. If this returns `false`, then the plugin should reset its
     /// size back to the previous value.

@@ -109,6 +109,10 @@ impl<P: Plugin, B: Backend<P>> GuiContext for WrapperGuiContext<P, B> {
         true
     }
 
+    fn request_process(&self) {
+        // The standalone backends call `process()` for every buffer
+    }
+
     unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {
         // Since there's no automation being recorded here, gestures don't mean anything
 

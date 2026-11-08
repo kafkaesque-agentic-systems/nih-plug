@@ -149,6 +149,10 @@ impl<P: ClapPlugin> GuiContext for WrapperGuiContext<P> {
         self.wrapper.request_resize()
     }
 
+    fn request_process(&self) {
+        self.wrapper.request_process();
+    }
+
     // All of these functions are supposed to be called from the main thread, so we'll put some
     // trust in the caller and assume that this is indeed the case
     unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
