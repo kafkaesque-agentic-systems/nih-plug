@@ -81,7 +81,7 @@ use super::context::{WrapperGuiContext, WrapperInitContext, WrapperProcessContex
 use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
 use crate::event_loop::{BackgroundThread, EventLoop, MainThreadExecutor, TASK_QUEUE_CAPACITY};
-use crate::midi::MidiResult;
+use crate::midi::{control_change, MidiResult};
 use crate::prelude::{
     AsyncExecutor, AudioIOLayout, AuxiliaryBuffers, BufferConfig, ClapPlugin, Editor, MidiConfig,
     NoteEvent, ParamFlags, ParamPtr, Params, ParentWindowHandle, Plugin, PluginNoteEvent,
@@ -147,6 +147,9 @@ pub struct Wrapper<P: ClapPlugin> {
     /// Sized in `clap_plugin::activate()` and never grown while processing, see
     /// [`push_input_event()`][Self::push_input_event()].
     input_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
+    /// The sustain pedal as `input_events` has seen it, for its full-queue policy (see
+    /// [`push_keeping_note_events()`]). Up at every activation.
+    input_pedal: AtomicRefCell<PedalState>,
     /// Input events lost since the plugin was created because a block brought more events than
     /// `input_events` holds. The plugin reads it through
     /// [`ProcessContext::dropped_input_events()`][crate::prelude::ProcessContext::dropped_input_events()].
@@ -565,6 +568,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             current_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
             input_events: AtomicRefCell::new(VecDeque::with_capacity(MIN_INPUT_EVENT_CAPACITY)),
+            input_pedal: AtomicRefCell::new(PedalState::default()),
             dropped_input_events: AtomicU64::new(0),
             output_events: AtomicRefCell::new(VecDeque::with_capacity(512)),
             dropped_output_events: AtomicU64::new(0),
@@ -918,6 +922,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
+        self.input_pedal.borrow_mut().begin_queue();
 
         let num_events = clap_call! { in_=>size(in_) };
         for event_idx in 0..num_events {
@@ -957,6 +962,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> Option<(usize, usize)> {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
+        self.input_pedal.borrow_mut().begin_queue();
 
         // To achieve this, we'll always read one event ahead
         let num_events = clap_call! { in_=>size(in_) };
@@ -1745,7 +1751,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         input_events: &mut VecDeque<PluginNoteEvent<P>>,
         event: PluginNoteEvent<P>,
     ) {
-        if push_keeping_note_events(input_events, event) {
+        if push_keeping_note_events(input_events, event, &mut self.input_pedal.borrow_mut()) {
             self.dropped_input_events.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1985,6 +1991,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             *wrapper.output_events.borrow_mut() =
                 VecDeque::with_capacity(input_events.capacity() + max_voice_capacity);
             *wrapper.input_events.borrow_mut() = input_events;
+            *wrapper.input_pedal.borrow_mut() = PedalState::default();
 
             // Also store this for later, so we can reinitialize the plugin after restoring state
             wrapper.current_buffer_config.store(Some(buffer_config));
@@ -3338,35 +3345,98 @@ pub(super) fn push_without_growing<E>(queue: &mut VecDeque<E>, event: E) -> bool
     false
 }
 
+/// The sustain pedal (MIDI CC 64, down from 64) as an input queue has seen it, so that a full
+/// queue can tell a pedal press or lift from a value that changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PedalState {
+    /// Whether the pedal was down before the queue's first event.
+    before: bool,
+    /// Whether the pedal is down after the last CC 64 queued.
+    queued: bool,
+}
+
+impl PedalState {
+    /// The queue was emptied: everything queued has reached the plugin.
+    fn begin_queue(&mut self) {
+        self.before = self.queued;
+    }
+}
+
+/// Whether `event` is the sustain pedal (CC 64), and then whether it is down.
+fn pedal_down<S>(event: &NoteEvent<S>) -> Option<bool> {
+    match event {
+        NoteEvent::MidiCC {
+            cc: control_change::DAMPER_PEDAL,
+            value,
+            ..
+        } => Some(*value >= 0.5),
+        _ => None,
+    }
+}
+
+/// Whether a full queue keeps `event` whatever it holds: a note on, note off or choke, or all
+/// sound off and all notes off (CC 120, CC 123). Losing one leaves a voice stuck or a note
+/// unplayed.
+fn always_kept<S>(event: &NoteEvent<S>) -> bool {
+    matches!(
+        event,
+        NoteEvent::NoteOn { .. }
+            | NoteEvent::NoteOff { .. }
+            | NoteEvent::Choke { .. }
+            | NoteEvent::MidiCC {
+                cc: control_change::ALL_SOUND_OFF | control_change::ALL_NOTES_OFF,
+                ..
+            }
+    )
+}
+
 /// Pushes `event` onto `queue` without growing it, since growing would allocate on the audio
-/// thread. A full queue keeps note ons, note offs and chokes over every other event: losing one
-/// of those leaves a voice stuck or a note unplayed, while a lost expression, modulation or
-/// controller value is superseded by the next one. So an incoming note on, note off or choke
-/// takes the place of the newest queued event that is none of these, and any other incoming
-/// event is dropped. Returns whether an event was lost. The queue stays in timing order since
-/// events arrive sorted and `VecDeque::remove()` shifts the rest without allocating.
-fn push_keeping_note_events<S>(queue: &mut VecDeque<NoteEvent<S>>, event: NoteEvent<S>) -> bool {
+/// thread. A full queue keeps note ons, note offs, chokes, all sound off and all notes off, and
+/// every sustain pedal (CC 64) that presses or lifts it, over every other event: losing one of
+/// those leaves a voice stuck or a note unplayed, while a lost expression, modulation or
+/// controller value is superseded by the next one, and a CC 64 that keeps the pedal as it was
+/// changes nothing. So a kept incoming event takes the place of the newest queued event that is
+/// not kept, and any other incoming event is dropped. `pedal` follows the CC 64s queued, across
+/// blocks. Returns whether an event was lost. The queue stays in timing order since events
+/// arrive sorted and `VecDeque::remove()` shifts the rest without allocating.
+fn push_keeping_note_events<S>(
+    queue: &mut VecDeque<NoteEvent<S>>,
+    event: NoteEvent<S>,
+    pedal: &mut PedalState,
+) -> bool {
+    let incoming_pedal = pedal_down(&event);
     if queue.len() < queue.capacity() {
+        if let Some(down) = incoming_pedal {
+            pedal.queued = down;
+        }
         queue.push_back(event);
         return false;
     }
 
-    let starts_or_ends_a_voice = |event: &NoteEvent<S>| {
-        matches!(
-            event,
-            NoteEvent::NoteOn { .. } | NoteEvent::NoteOff { .. } | NoteEvent::Choke { .. }
-        )
-    };
-    if !starts_or_ends_a_voice(&event) {
+    let presses_or_lifts = incoming_pedal.is_some_and(|down| down != pedal.queued);
+    if !(always_kept(&event) || presses_or_lifts) {
         return true;
     }
-    let Some(evicted) = queue
-        .iter()
-        .rposition(|queued| !starts_or_ends_a_voice(queued))
-    else {
+    // The newest queued event that is not kept: a CC 64 counts as kept when it changed the
+    // pedal from the one before it.
+    let mut down = pedal.before;
+    let mut evicted = None;
+    for (index, queued) in queue.iter().enumerate() {
+        let kept = match pedal_down(queued) {
+            Some(now) => std::mem::replace(&mut down, now) != now,
+            None => always_kept(queued),
+        };
+        if !kept {
+            evicted = Some(index);
+        }
+    }
+    let Some(evicted) = evicted else {
         return true;
     };
     queue.remove(evicted);
+    if let Some(down) = incoming_pedal {
+        pedal.queued = down;
+    }
     queue.push_back(event);
 
     true
@@ -3444,6 +3514,19 @@ mod tests {
         }
     }
 
+    fn controller(timing: u32, cc: u8, value: f32) -> Event {
+        NoteEvent::MidiCC {
+            timing,
+            channel: 0,
+            cc,
+            value,
+        }
+    }
+
+    fn pedal(timing: u32, value: f32) -> Event {
+        controller(timing, control_change::DAMPER_PEDAL, value)
+    }
+
     /// A queue holding exactly `events`, so that it is full.
     fn full_queue<const N: usize>(events: [Event; N]) -> VecDeque<Event> {
         let mut queue = VecDeque::with_capacity(N);
@@ -3463,7 +3546,11 @@ mod tests {
     fn events_below_capacity_are_queued_in_order() {
         let mut queue = VecDeque::with_capacity(8);
         for event in [pressure(0), note_on(1), mod_wheel(2), note_off(3)] {
-            assert!(!push_keeping_note_events(&mut queue, event));
+            assert!(!push_keeping_note_events(
+                &mut queue,
+                event,
+                &mut PedalState::default()
+            ));
         }
 
         assert_eq!(
@@ -3477,8 +3564,16 @@ mod tests {
         let mut queue = full_queue([note_on(0), pressure(1), note_on(2), pressure(3)]);
         let capacity = queue.capacity();
 
-        assert!(push_keeping_note_events(&mut queue, pressure(100)));
-        assert!(push_keeping_note_events(&mut queue, mod_wheel(101)));
+        assert!(push_keeping_note_events(
+            &mut queue,
+            pressure(100),
+            &mut PedalState::default()
+        ));
+        assert!(push_keeping_note_events(
+            &mut queue,
+            mod_wheel(101),
+            &mut PedalState::default()
+        ));
 
         assert_eq!(
             Vec::from(queue.clone()),
@@ -3502,7 +3597,11 @@ mod tests {
         let capacity = queue.capacity();
 
         for event in [note_off(100), choke(101), note_on(102)] {
-            assert!(push_keeping_note_events(&mut queue, event));
+            assert!(push_keeping_note_events(
+                &mut queue,
+                event,
+                &mut PedalState::default()
+            ));
         }
 
         // The controller, then the newest pressure events made room; the queue kept its order
@@ -3540,11 +3639,121 @@ mod tests {
     fn note_event_is_dropped_when_only_note_events_are_queued() {
         let mut queue = full_queue([note_on(0), note_off(1), choke(2), note_on(3)]);
 
-        assert!(push_keeping_note_events(&mut queue, note_off(100)));
+        assert!(push_keeping_note_events(
+            &mut queue,
+            note_off(100),
+            &mut PedalState::default()
+        ));
 
         assert_eq!(
             Vec::from(queue),
             [note_on(0), note_off(1), choke(2), note_on(3)]
         );
+    }
+
+    #[test]
+    fn full_queue_keeps_all_sound_off_and_all_notes_off() {
+        let mut queue = full_queue([note_on(0), mod_wheel(1), pressure(2)]);
+        let mut state = PedalState::default();
+
+        for cc in [control_change::ALL_SOUND_OFF, control_change::ALL_NOTES_OFF] {
+            assert!(push_keeping_note_events(
+                &mut queue,
+                controller(100, cc, 0.0),
+                &mut state
+            ));
+        }
+
+        assert_eq!(
+            Vec::from(queue),
+            [
+                note_on(0),
+                controller(100, control_change::ALL_SOUND_OFF, 0.0),
+                controller(100, control_change::ALL_NOTES_OFF, 0.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_queue_keeps_a_pedal_press_or_lift_and_drops_a_pedal_that_changes_nothing() {
+        let mut queue = full_queue([note_on(0), pressure(1), mod_wheel(2), pressure(3)]);
+        let mut state = PedalState::default();
+
+        // Up: the press is kept, a further down value is not, the lift is, then a value that
+        // keeps it up is not
+        for event in [
+            pedal(100, 1.0),
+            pedal(101, 0.8),
+            pedal(102, 0.0),
+            pedal(103, 0.2),
+        ] {
+            assert!(push_keeping_note_events(&mut queue, event, &mut state));
+        }
+
+        assert_eq!(
+            Vec::from(queue),
+            [note_on(0), pressure(1), pedal(100, 1.0), pedal(102, 0.0)]
+        );
+        assert_eq!(
+            state,
+            PedalState {
+                before: false,
+                queued: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_queued_pedal_that_changed_nothing_makes_room_like_a_controller() {
+        let mut queue = VecDeque::with_capacity(3);
+        let mut state = PedalState::default();
+        for event in [note_on(0), pedal(1, 1.0), pedal(2, 0.9)] {
+            assert!(!push_keeping_note_events(&mut queue, event, &mut state));
+        }
+
+        assert!(push_keeping_note_events(
+            &mut queue,
+            note_off(100),
+            &mut state
+        ));
+        assert_eq!(
+            Vec::from(queue.clone()),
+            [note_on(0), pedal(1, 1.0), note_off(100)]
+        );
+
+        // Only kept events are left: even a lift is lost then, and the state stays down
+        assert!(push_keeping_note_events(
+            &mut queue,
+            pedal(101, 0.0),
+            &mut state
+        ));
+        assert_eq!(Vec::from(queue), [note_on(0), pedal(1, 1.0), note_off(100)]);
+        assert!(state.queued);
+    }
+
+    #[test]
+    fn the_pedal_state_carries_from_one_queue_to_the_next() {
+        let mut queue = VecDeque::with_capacity(2);
+        let mut state = PedalState::default();
+        assert!(!push_keeping_note_events(
+            &mut queue,
+            pedal(0, 1.0),
+            &mut state
+        ));
+        queue.clear();
+        state.begin_queue();
+
+        // The next block: the pedal is down before it, so a further down value changes
+        // nothing and is the newest event to make room
+        for event in [mod_wheel(0), pedal(1, 0.9)] {
+            assert!(!push_keeping_note_events(&mut queue, event, &mut state));
+        }
+        assert!(push_keeping_note_events(
+            &mut queue,
+            note_on(100),
+            &mut state
+        ));
+
+        assert_eq!(Vec::from(queue), [mod_wheel(0), note_on(100)]);
     }
 }
