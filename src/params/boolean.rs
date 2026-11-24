@@ -184,17 +184,21 @@ impl ParamMut for BoolParam {
             (self.preview_plain(normalized_value), normalized_value)
         };
 
+        // The set value is stored whatever the played value does: while the host's modulation
+        // holds the played value at a bound, a new set value changes nothing audible but is what
+        // the editor shows and the state saves (grain-ai review `phase-5-34`).
+        self.normalized_value
+            .store(normalized_value, Ordering::Relaxed);
+        self.unmodulated_value
+            .store(unmodulated_value, Ordering::Relaxed);
+        self.unmodulated_normalized_value
+            .store(unmodulated_normalized_value, Ordering::Relaxed);
+
         // REAPER spams automation events with the same value. This prevents callbacks from firing
         // multiple times. This can be problematic when they're used to trigger expensive
         // computations when a parameter changes.
         let old_value = self.value.swap(value, Ordering::Relaxed);
         if value != old_value {
-            self.normalized_value
-                .store(normalized_value, Ordering::Relaxed);
-            self.unmodulated_value
-                .store(unmodulated_value, Ordering::Relaxed);
-            self.unmodulated_normalized_value
-                .store(unmodulated_normalized_value, Ordering::Relaxed);
             if let Some(f) = &self.value_changed {
                 f(value);
             }
@@ -331,5 +335,22 @@ impl BoolParam {
     pub fn hide_in_generic_ui(mut self) -> Self {
         self.flags.insert(ParamFlags::HIDE_IN_GENERIC_UI);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A set value is stored while the host's modulation holds the played value at a bound
+    /// (grain-ai review `phase-5-34`).
+    #[test]
+    fn a_set_value_is_kept_while_modulation_pins_the_played_value() {
+        let param = BoolParam::new("b", false);
+        param.modulate_value(1.0);
+        assert!(param.modulated_plain_value());
+        param.set_plain_value(true);
+        assert!(param.modulated_plain_value());
+        assert!(param.unmodulated_plain_value());
     }
 }
